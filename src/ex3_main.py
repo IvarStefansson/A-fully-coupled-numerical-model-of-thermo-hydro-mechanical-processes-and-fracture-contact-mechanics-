@@ -1,0 +1,435 @@
+"""
+Example setup and run script for the 3d stimulation and long-term cooling example.
+
+Main differences from the example 1 setup are related to geometry, BCs, wells and
+gravity.
+"""
+
+import numpy as np
+import porepy as pp
+import logging
+import pdb
+import utils
+from typing import Tuple
+from ex1_main import Example1Model, Water, Granite
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+LS = 150
+
+
+class Example3Model(Example1Model):
+    """
+    This class provides the parameter specification differing from examples 1 and 2.
+    """
+
+    def set_fields(self, params, gb):
+        super().set_fields(params, gb)
+        self.scalar_scale = 1e7
+        self.temperature_scale = 1e0
+        self.length_scale = params["length_scale"]
+
+        self.T_0_Kelvin = 350
+        self.background_temp_C = pp.KELKIN_to_CELSIUS(self.T_0_Kelvin)
+
+        self.initial_aperture = 2e-3 / self.length_scale
+        self.export_fields.append("well")
+        self.production_well_key = "production_well"
+        self.gravity_on = True
+        self.export_fields.append("u_exp_0")
+        self.export_fields.append("aperture_0")
+
+    def create_grid(self):
+        """
+        Method that creates the GridBucket of a 3D domain with three fractures. 
+        The first fracture is the one where injection takes place and
+        production takes place in the third fracture. Fractures 1 and 2 intersect.
+        """
+        # Define the three fractures
+        n_points = 16
+
+        # Injection
+        f_1 = pp.EllipticFracture(
+            np.array([10, 3.5, -3]), 11, 18, 0.5, 0, 0, num_points=n_points,
+        )
+        f_2 = pp.EllipticFracture(
+            np.array([1, 5, 1]),
+            15,
+            10,
+            np.pi * 0,
+            np.pi / 4.0,
+            np.pi / 2.0,
+            num_points=n_points,
+        )
+
+        # Production
+        f_3 = pp.EllipticFracture(
+            np.array([-13, 0, 0]),
+            20,
+            10,
+            0.5,
+            np.pi / 3,
+            np.pi / 1.6,
+            num_points=n_points,
+        )
+        self.fractures = [f_1, f_2, f_3]
+
+        # Define the domain
+        size = 50
+        self.box = {
+            "xmin": -size,
+            "xmax": size,
+            "ymin": -size,
+            "ymax": size,
+            "zmin": -size,
+            "zmax": size,
+        }
+        # Make a fracture network
+        self.network = pp.FractureNetwork3d(self.fractures, domain=self.box)
+        # Generate the mixed-dimensional mesh
+        # write_fractures_to_csv(self)
+        gb = self.network.mesh(self.mesh_args)
+
+        pp.contact_conditions.set_projections(gb)
+
+        self.gb = gb
+        self.Nd = self.gb.dim_max()
+
+        # Tag the wells
+        self._tag_well_cells()
+        self.n_frac = len(gb.grids_of_dimension(self.Nd - 1))
+        self.update_all_apertures(to_iterate=False)
+        self.update_all_apertures()
+
+    def faces_to_fix(self, g):
+        """
+        Identify three boundary faces to fix (u=0). This should allow us to assign
+        Neumann "background stress" conditions on the rest of the boundary faces.
+        """
+        all_bf, *_ = self.domain_boundary_sides(g)
+        point = np.array(
+            [
+                [(self.box["xmin"] + self.box["xmax"]) / 2],
+                [(self.box["ymin"] + self.box["ymax"]) / 2],
+                [self.box["zmax"]],
+            ]
+        )
+        distances = pp.distances.point_pointset(point, g.face_centers[:, all_bf])
+        indexes = np.argsort(distances)
+        faces = all_bf[indexes[: self.Nd]]
+        return faces
+
+    def _tag_well_cells(self):
+        """
+        Tag well cells with unitary values, positive for injection cells and negative
+        for production cells.
+        """
+        for g, d in self.gb:
+            tags = np.zeros(g.num_cells)
+            if g.dim < self.Nd:
+                point = np.array(
+                    [
+                        [(self.box["xmin"] + self.box["xmax"]) / 2],
+                        [self.box["ymax"]],
+                        [0],
+                    ]
+                )
+                distances = pp.distances.point_pointset(point, g.cell_centers)
+                indexes = np.argsort(distances)
+                if d["node_number"] == 1:
+                    tags[indexes[-1]] = 1  # injection
+                elif d["node_number"] == 3:
+                    tags[indexes[-1]] = -1  # production
+                    # write_well_cell_to_csv(g, indexes[-1], self)
+            g.tags["well_cells"] = tags
+            pp.set_state(d, {"well": tags.copy()})
+
+    def source_flow_rates(self) -> Tuple[int, int]:
+        """
+        The rate is given in l/s = m^3/s e-3. Length scaling also needed to convert from
+        the scaled length to m.
+        The values returned depend on the simulation phase.
+        """
+        t = self.time
+        tol = 1e-10
+        injection, production = 0, 0
+        if t > self.phase_limits[1] + tol and t < self.phase_limits[2] + tol:
+            injection = 75
+            production = 0
+        elif t > self.phase_limits[2] + tol:
+            injection, production = 20, -20
+        w = pp.MILLI * (pp.METER / self.length_scale) ** self.Nd
+        return injection * w, production * w
+
+    def bc_type_mechanics(self, g) -> pp.BoundaryConditionVectorial:
+        """
+        We set Neumann values imitating an anisotropic background stress regime on all
+        but three faces, which are fixed to ensure a unique solution.
+        """
+        all_bf, *_, bottom = self.domain_boundary_sides(g)
+        faces = self.faces_to_fix(g)
+        # write_fixed_faces_to_csv(g, faces, self)
+        bc = pp.BoundaryConditionVectorial(g, faces, "dir")
+        frac_face = g.tags["fracture_faces"]
+        bc.is_neu[:, frac_face] = False
+        bc.is_dir[:, frac_face] = True
+        return bc
+
+    def bc_type_scalar(self, g) -> pp.BoundaryCondition:
+        """
+        We prescribe the pressure value at all external boundaries.
+        """
+        # Define boundary regions
+        all_bf, *_ = self.domain_boundary_sides(g)
+        return pp.BoundaryCondition(g, all_bf, "dir")
+
+    def bc_values_mechanics(self, g) -> np.ndarray:
+        """
+        Lithostatic mechanical BC values.
+        """
+        bc_values = np.zeros((g.dim, g.num_faces))
+        if np.isclose(self.time, self.phase_limits[0]):
+            return bc_values.ravel("F")
+
+        # Retrieve the boundaries where values are assigned
+        all_bf, east, west, north, south, top, bottom = self.domain_boundary_sides(g)
+        A = g.face_areas
+        # Domain centred at 1 km below surface
+
+        # Gravity acceleration
+        gravity = (
+            pp.GRAVITY_ACCELERATION
+            * self.rock.DENSITY
+            * self._depth(g.face_centers)
+            / self.scalar_scale
+        )
+
+        we, sn, bt = 2 / 3, 3 / 2, 1
+        we, sn, bt = 3 / 4, 3 / 2, 1
+        bc_values[0, west] = (we * gravity[west]) * A[west]
+        bc_values[0, east] = -(we * gravity[east]) * A[east]
+        bc_values[1, south] = (sn * gravity[south]) * A[south]
+        bc_values[1, north] = -(sn * gravity[north]) * A[north]
+        if self.Nd > 2:
+            bc_values[2, bottom] = (bt * gravity[bottom]) * A[bottom]
+            bc_values[2, top] = -(bt * gravity[top]) * A[top]
+
+        faces = self.faces_to_fix(g)
+        bc_values[:, faces] = 0
+
+        return bc_values.ravel("F")
+
+    def bc_values_scalar(self, g) -> np.ndarray:
+        """
+        Hydrostatic pressure BC values.
+        """
+        # Retrieve the boundaries where values are assigned
+        all_bf, *_ = self.domain_boundary_sides(g)
+        bc_values = np.zeros(g.num_faces)
+        if self.gravity_on:
+            depth = self._depth(g.face_centers[:, all_bf])
+        else:
+            depth = np.ones(all_bf.size) * pp.KILO * pp.METER
+
+        bc_values[all_bf] = self.fluid.hydrostatic_pressure(depth) / self.scalar_scale
+
+        return bc_values
+
+    def bc_values_temperature(self, g) -> np.ndarray:
+        """
+        Zero perturbation from initial temperature at all boundaries.
+        """
+        return np.zeros(g.num_faces)
+
+    def source_mechanics(self, g) -> np.ndarray:
+        """
+        Gravity term.
+        """
+        values = np.zeros((self.Nd, g.num_cells))
+        values[2] = (
+            pp.GRAVITY_ACCELERATION
+            * self.rock.DENSITY
+            * g.cell_volumes
+            * self.length_scale
+            / self.scalar_scale
+        )
+        return values.ravel("F")
+
+    def source_scalar(self, g) -> np.ndarray:
+        """
+        Source term for the scalar equation.
+        For slightly compressible flow in the present formulation, this has units of m^3.
+        
+        Sources are handled by ScalarSource discretizations.
+        The implicit scheme yields multiplication of the rhs by dt, but
+        this is not incorporated in ScalarSource, hence we do it here.
+        """
+        injection, production = self.source_flow_rates()
+        wells = (
+            injection
+            * g.tags["well_cells"]
+            * self.time_step
+            * g.tags["well_cells"].clip(min=0)
+        )
+        wells += (
+            production
+            * g.tags["well_cells"]
+            * self.time_step
+            * g.tags["well_cells"].clip(max=0)
+        )
+
+        return wells
+
+    def source_temperature(self, g) -> np.ndarray:
+        """
+        Sources are handled by ScalarSource discretizations.
+        The implicit scheme yields multiplication of the rhs by dt, but
+        this is not incorporated in ScalarSource, hence we do it here.
+        """
+        injection, production = self.source_flow_rates()
+
+        # Injection well
+        t_in = -80
+        weight = (
+            self.density(g, dT=t_in * self.temperature_scale)
+            * self.fluid.specific_heat_capacity(self.background_temp_C)
+            * self.time_step
+            / self.T_0_Kelvin
+        )
+        rhs = t_in * weight * injection * g.tags["well_cells"].clip(min=0)
+
+        # Production well during phase III
+        weight = (
+            self.density(g)
+            * self.fluid.specific_heat_capacity(self.background_temp_C)
+            * self.time_step
+            / self.T_0_Kelvin
+        )
+        dp, p1, p0 = self._variable_increment(g, "p", self.scalar_scale)
+
+        lhs = (
+            weight
+            * production.clip(max=0)
+            * g.tags["well_cells"].clip(max=0)
+            / g.cell_volumes
+        )
+        # Set this directly into d to avoid additional return
+        d = self.gb.node_props(g)
+        pp.initialize_data(g, d, self.production_well_key, {"mass_weight": lhs})
+        return rhs
+
+    def bc_type_temperature(self, g) -> pp.BoundaryCondition:
+        """
+        We prescribe the temperature value at all boundaries.
+        """
+        # Define boundary regions
+        all_bf, east, west, *_ = self.domain_boundary_sides(g)
+        return pp.BoundaryCondition(g, all_bf, "dir")
+
+    def _set_time_parameters(self):
+        """
+        Specify time parameters.
+        """
+        # For the initialization run, we use the following
+        # start time
+        self.time = -1e2 * pp.YEAR
+        # and time step
+        self.time_step = -self.time / 2
+
+        # We use
+        self.end_time = 15 * pp.YEAR
+        self.max_time_step = self.end_time / 15
+        self.phase_limits = [self.time, 0, 10 * 3600, self.end_time]
+        self.phase_time_steps = [self.time_step, 2 / 3 * pp.HOUR, self.end_time / 15, 1]
+        self.time_step_factor = 1.0
+
+    def _depth(self, coords) -> np.ndarray:
+        """
+        Unscaled depth. We center the domain at 1 km below the surface.
+        """
+        return 1.0 * pp.KILO * pp.METER - self.length_scale * coords[2]
+
+    def set_rock_and_fluid(self):
+        """
+        Set rock and fluid properties to those of granite and water.
+        We ignore all temperature effects except in fluid density.
+        """
+        self.rock = Granite()
+        self.rock.BULK_MODULUS = pp.params.rock.bulk_from_lame(
+            self.rock.LAMBDA, self.rock.MU
+        )
+        self.fluid = Water()
+
+    def assign_discretizations(self):
+        """Assign MassMatrix discretiztion to account for production well in the 
+        energy balance.
+        """
+        super().assign_discretizations()
+        discr = pp.MassMatrix(self.production_well_key)
+
+        for g, d in self.gb:
+            if g.dim == self.Nd - 1:
+                d[pp.DISCRETIZATION][self.temperature_variable].update(
+                    {"production_well": discr}
+                )
+
+    def save_data(self, errors, iteration_counter):
+        """
+        Save displacement jumps and number of iterations for visualisation purposes. 
+        These are written to file and plotted against time in Figure 9.
+        """
+        super().save_data(errors, iteration_counter)
+        if "well_p" not in self.__dict__:
+            self.well_p = np.empty((0, 2))
+            self.well_T = np.empty((0, 2))
+
+        pressures = np.zeros((1, 2))
+        temperatures = np.zeros((1, 2))
+
+        for g, d in self.gb:
+
+            T = d[pp.STATE][self.temperature_variable] * self.temperature_scale
+            p = d[pp.STATE][self.scalar_variable] * self.scalar_scale
+            ind = np.nonzero(g.tags["well_cells"])
+            if d["node_number"] == 1:
+                pressures[0, 0] = p[ind]
+                temperatures[0, 0] = T[ind]
+            elif d["node_number"] == 3:
+                pressures[0, 1] = p[ind]
+                temperatures[0, 1] = T[ind]
+
+        self.well_p = np.concatenate((self.well_p, pressures))
+        self.well_T = np.concatenate((self.well_T, temperatures))
+
+
+if __name__ == "__main__":
+    # Define mesh sizes for grid generation
+    ls = 15
+    mesh_size = 3
+    mesh_args = {
+        "mesh_size_frac": mesh_size,
+        "mesh_size_min": 0.5 * mesh_size,
+        "mesh_size_bound": 3 * mesh_size,
+    }
+    params = {
+        "folder_name": "ex3",
+        "nl_convergence_tol": 1e-10,
+        "max_iterations": 200,
+        "file_name": "thm",
+        "mesh_args": mesh_args,
+        "dilation_angle": np.radians(5.0),
+        "dilation_angle_constant_g": 0,
+        "length_scale": ls,
+        "max_memory": 7e7,
+        "use_umfpack": True,
+    }
+
+    pickle_file_name = params["folder_name"] + "/gb"
+
+    m = Example3Model(params, None)
+    m.linear_solver = "pyamg"
+    pp.run_time_dependent_model(m, params)
+    m.export_pvd()
+    utils.write_pickle(m.gb, pickle_file_name)
+    utils.write_fracture_data_txt(m)
