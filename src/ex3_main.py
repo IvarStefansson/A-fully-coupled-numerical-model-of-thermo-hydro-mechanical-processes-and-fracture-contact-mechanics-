@@ -8,7 +8,6 @@ gravity.
 import numpy as np
 import porepy as pp
 import logging
-import pdb
 import utils
 from typing import Tuple
 from ex1_main import Example1Model, Water, Granite
@@ -39,6 +38,7 @@ class Example3Model(Example1Model):
         self.gravity_on = True
         self.export_fields.append("u_exp_0")
         self.export_fields.append("aperture_0")
+        self._iteration = 0
 
     def create_grid(self):
         """
@@ -290,7 +290,7 @@ class Example3Model(Example1Model):
         injection, production = self.source_flow_rates()
 
         # Injection well
-        t_in = -80
+        t_in = -70
         weight = (
             self.density(g, dT=t_in * self.temperature_scale)
             * self.fluid.specific_heat_capacity(self.background_temp_C)
@@ -339,10 +339,10 @@ class Example3Model(Example1Model):
 
         # We use
         self.end_time = 15 * pp.YEAR
-        self.max_time_step = self.end_time / 15
-        self.phase_limits = [self.time, 0, 10 * 3600, self.end_time]
-        self.phase_time_steps = [self.time_step, 2 / 3 * pp.HOUR, self.end_time / 15, 1]
-        self.time_step_factor = 1.0
+        self.max_time_step = self.end_time / 20
+        self.phase_limits = [self.time, 0, 10 * pp.HOUR, self.end_time]
+        self.phase_time_steps = [self.time_step, 2 / 3 * pp.HOUR, self.end_time / 35, 1]
+        self.time_step_factor = 1.25
 
     def _depth(self, coords) -> np.ndarray:
         """
@@ -402,19 +402,64 @@ class Example3Model(Example1Model):
         self.well_p = np.concatenate((self.well_p, pressures))
         self.well_T = np.concatenate((self.well_T, temperatures))
 
+    def compute_fluxes(self):
+        gb = self.gb
+        for g, d in gb:
+
+            pa = d[pp.PARAMETERS][self.temperature_parameter_key]
+            if self._iteration > 2:
+                pa["darcy_flux_0"] = pa["darcy_flux_1"].copy()
+            if self._iteration > 1:
+                pa["darcy_flux_1"] = pa["darcy_flux"].copy()
+        for e, d in gb.edges():
+            pa = d[pp.PARAMETERS][self.temperature_parameter_key]
+            if self._iteration > 2:
+                pa["darcy_flux_0"] = pa["darcy_flux_1"].copy()
+            if self._iteration > 1:
+                pa["darcy_flux_1"] = pa["darcy_flux"].copy()
+
+        super().compute_fluxes()
+        a, b, c = 1, 1, 0
+        node_update, edge_update = 0, 0
+        if self._iteration > 4:
+            for g, d in gb:
+
+                pa = d[pp.PARAMETERS][self.temperature_parameter_key]
+
+                v0 = pa["darcy_flux_0"]
+                v1 = pa["darcy_flux_1"]
+                v2 = pa["darcy_flux"]
+                pa["darcy_flux"] = (a * v2 + b * v1 + c * v0) / (a + b + c)
+                node_update += np.sum(np.power(v1 - v2, 2)) / np.sum(np.power(v2, 2))
+            for e, d in gb.edges():
+                pa = d[pp.PARAMETERS][self.temperature_parameter_key]
+
+                v0 = pa["darcy_flux_0"]
+                v1 = pa["darcy_flux_1"]
+                v2 = pa["darcy_flux"]
+                pa["darcy_flux"] = (a * v2 + b * v1 + c * v0) / (a + b + c)
+                edge_update += np.sum(np.power(v1 - v2, 2)) / np.sum(np.power(v2, 2))
+            logger.info(
+                "Smoothed fluxes by {:.2e} and edge {:.2e} at time {:.2e}".format(
+                    node_update, edge_update, self.time
+                )
+            )
+
+        return
+
 
 if __name__ == "__main__":
     # Define mesh sizes for grid generation
     ls = 15
-    mesh_size = 3
+    mesh_size = 3.6
     mesh_args = {
         "mesh_size_frac": mesh_size,
         "mesh_size_min": 0.5 * mesh_size,
-        "mesh_size_bound": 3 * mesh_size,
+        "mesh_size_bound": 3.6 * mesh_size,
     }
     params = {
         "folder_name": "ex3",
-        "nl_convergence_tol": 1e-10,
+        "nl_convergence_tol": 2e-8,
         "max_iterations": 200,
         "file_name": "thm",
         "mesh_args": mesh_args,
@@ -428,7 +473,6 @@ if __name__ == "__main__":
     pickle_file_name = params["folder_name"] + "/gb"
 
     m = Example3Model(params, None)
-    m.linear_solver = "pyamg"
     pp.run_time_dependent_model(m, params)
     m.export_pvd()
     utils.write_pickle(m.gb, pickle_file_name)
