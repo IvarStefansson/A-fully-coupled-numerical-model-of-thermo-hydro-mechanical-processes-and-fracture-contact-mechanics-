@@ -1,7 +1,4 @@
 """
-This is a setup class for solving the THM equations with contact between the fractures. 
-Fluid and temperature flow in the fractures is included in the model.
-
 The simulation is set up for four phases:
     I the system is allowed to reach equilibrium under the influence of the mechanical BCs.
     II pressure gradient from left to right is added.
@@ -9,7 +6,7 @@ The simulation is set up for four phases:
 
 Compare with model formulation in the paper.
 
-The 2d geometry is borrowed from Berge et al (2019) and extended by an additional fracture, 
+The 2d geometry is borrowed from Berge et al (2019) and extended by an additional fracture,
 which forms an X intersection with the bottom left fracture of that network:
 The domain is (0, 2) x (0, 1) and contains 8 fractures, two of which form an L intersection
 and two of which form an X intersection.
@@ -19,7 +16,7 @@ Setup at a glance
     One horizontal fracture
     Displacement condition on the north (y = y_max) boundary
     Dirichlet values for p and T at left and right boundaries
- 
+
             \
              \ u = [0.005, -0.002]
               V
@@ -28,16 +25,19 @@ Setup at a glance
  p=1    | ----__   ------   | p=0
  T=-100 |               ----| T=0
     100 |   X     ------    |
-        |____________\______
+        |____________\______|
         \\\\\\\\\\\\\\
 """
-import scipy.sparse.linalg as spla
+import logging
+import os
+import time
+
 import numpy as np
 import porepy as pp
+import scipy.sparse.linalg as spla
 from porepy.models.thm_model import THM
-import logging, os, time
-import utils, pdb
 
+import thm_utils
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -90,7 +90,7 @@ class Example1Model(THM):
     def __init__(self, params, gb):
         super().__init__(params)
         # Set additional case specific fields
-        self.set_fields(params, gb)
+        self._set_fields(params, gb)
 
     def create_grid(self):
         """
@@ -99,6 +99,8 @@ class Example1Model(THM):
         mortar grid.
         """
         gb = self.gb
+        # gb, network = create_grid(self.params["mesh_args"])
+        # self.gb = gb
         self.box = {
             "xmin": 0,
             "ymin": 0,
@@ -107,20 +109,20 @@ class Example1Model(THM):
         }
         pp.contact_conditions.set_projections(gb)
 
-        self.Nd = gb.dim_max()
-        self.n_frac = len(gb.grids_of_dimension(self.Nd - 1))
+        self._Nd = gb.dim_max()
+        self.n_frac = len(gb.grids_of_dimension(self._Nd - 1))
 
-    def porosity(self, g) -> float:
-        if g.dim == self.Nd:
+    def _porosity(self, g) -> float:
+        if g.dim == self._Nd:
             return 0.01
         else:
             return 1.0
 
-    def bc_type_mechanics(self, g) -> pp.BoundaryConditionVectorial:
+    def _bc_type_mechanics(self, g) -> pp.BoundaryConditionVectorial:
         """
         Dirichlet values at top and bottom.
         """
-        all_bf, east, west, north, south, _, _ = self.domain_boundary_sides(g)
+        _, _, _, north, south, _, _ = self._domain_boundary_sides(g)
         bc = pp.BoundaryConditionVectorial(g, south + north, "dir")
         # Assign Dirichlet conditions on internal boundaries
         frac_face = g.tags["fracture_faces"]
@@ -128,150 +130,176 @@ class Example1Model(THM):
         bc.is_dir[:, frac_face] = True
         return bc
 
-    def bc_values_mechanics(self, g) -> np.ndarray:
-        """ Dirichlet displacement on the top, fixed on bottom and 0 Neumann
+    def _bc_values_mechanics(self, g) -> np.ndarray:
+        """Dirichlet displacement on the top, fixed on bottom and 0 Neumann
         on left and right.
         """
         # Retrieve the boundaries where values are assigned
-        all_bf, east, west, north, south, top, bottom = self.domain_boundary_sides(g)
+        _, _, _, north, south, _, _ = self._domain_boundary_sides(g)
         bc_values = np.zeros((g.dim, g.num_faces))
         # Assign values on the top (or "north") side
         x = 5e-4 / self.length_scale
         y = -2e-4 / self.length_scale
+        # if self.time > self.phase_limits[0]:
         bc_values[0, north] = x
         bc_values[1, north] = y
         return bc_values.ravel("F")
 
-    def bc_type_scalar(self, g) -> pp.BoundaryCondition:
+    def _bc_type_scalar(self, g) -> pp.BoundaryCondition:
         """
         We prescribe the pressure value at the east and west boundary
         No flow across top or bottom.
         """
         # Define boundary regions
-        all_bf, east, west, *_ = self.domain_boundary_sides(g)
+        _, east, west, *_ = self._domain_boundary_sides(g)
         return pp.BoundaryCondition(g, east + west, "dir")
 
-    def bc_values_scalar(self, g) -> np.ndarray:
+    def _bc_values_scalar(self, g) -> np.ndarray:
         # Retrieve the boundaries where values are assigned
-        all_bf, east, west, north, south, top, bottom = self.domain_boundary_sides(g)
+        _, _, west, *_ = self._domain_boundary_sides(g)
         bc_values = np.zeros(g.num_faces)
         if self.time > self.phase_limits[1]:
             bc_values[west] = 4e7 / self.scalar_scale
         return bc_values
 
-    def bc_type_temperature(self, g) -> pp.BoundaryCondition:
+    def _bc_type_temperature(self, g) -> pp.BoundaryCondition:
         """
         We prescribe the temperature value at the east and west boundary.
         No heat flow across top or bottom.
         """
         # Define boundary regions
-        all_bf, east, west, *_ = self.domain_boundary_sides(g)
+        _, east, west, *_ = self._domain_boundary_sides(g)
         return pp.BoundaryCondition(g, east + west, "dir")
 
-    def bc_values_temperature(self, g) -> np.ndarray:
-        """ Cooling on the left from the onset of phase III.
-        """
+    def _bc_values_temperature(self, g) -> np.ndarray:
+        """Cooling on the left from the onset of phase III."""
         # Retrieve the boundaries where values are assigned
-        all_bf, east, west, *_ = self.domain_boundary_sides(g)
+        _, east, west, *_ = self._domain_boundary_sides(g)
         bc_values = np.zeros(g.num_faces)
+        bc_values[east + west] = self.T_0_Kelvin / self.temperature_scale
         if self.time > self.phase_limits[2]:
-            bc_values[west] = -15 / self.temperature_scale
+            bc_values[west] = (self.T_0_Kelvin - 15) / self.temperature_scale
         return bc_values
 
-    def biot_alpha(self, g) -> np.ndarray:
-        if g.dim == self.Nd:
+    def _biot_alpha(self, g) -> np.ndarray:
+        if g.dim == self._Nd:
             return 0.8
         else:
             return 1.0
 
-    def biot_beta(self, g):
+    def _biot_beta(self, g):
         """
         For TM, the coefficient is the product of the bulk modulus (=inverse of
         the compressibility) and the volumetric thermal expansion coefficient.
         """
-        if g.dim == self.Nd:
+        if g.dim == self._Nd:
             # Factor 3 for volumetric/linear, since the pp.Granite
             # thermal expansion expansion coefficient is the linear one at 20 degrees C.
             return self.rock.BULK_MODULUS * 3 * self.rock.THERMAL_EXPANSION
         else:
             # Solution debendent coefficient computed from previous iterate,
             # see Eq. (xx)
-            _, T2, _ = self._variable_increment(g, self.temperature_variable)
-           
-            T0K = self.T_0_Kelvin
-          
-            return T2 / T0K * self.density(g)
+            _, T_k, _ = self._variable_increment(g, self.temperature_variable)
 
-    def density(self, g, dp=None, dT=None) -> np.ndarray:
-        """ Density computed from current pressure and temperature solution
+            beta = (
+                T_k
+                / self.T_0_Kelvin
+                * self._fluid_density(g)
+                * self.fluid.specific_heat_capacity()
+            )
+            return beta
+
+    def _fluid_density(self, g, dp=None, dT=None) -> np.ndarray:
+        """Fluid density computed from current pressure and temperature solution
         taken from the previous iterate.
         """
         if dp is None:
-            
             dp, p_k, p_n = self._variable_increment(
                 g, self.scalar_variable, scale=self.scalar_scale
             )
-            dp = p_k
-      
+            dp = p_k - pp.ATMOSPHERIC_PRESSURE
+
         if dT is None:
             _, T_k, T_n = self._variable_increment(
                 g, self.temperature_variable, self.temperature_scale
             )
-            dT = T_k
+            dT = T_k - self.T_0_Kelvin
+            # Clip to aid convergence. This avoids clear violations of the
+            # assumption of small temperature variations
+            lim = self.T_0_Kelvin / 3
+            dT = np.clip(dT, a_min=-lim, a_max=lim)
 
         rho_0 = 1e3 * (pp.KILOGRAM / pp.METER ** 3) * np.ones(g.num_cells)
         rho = rho_0 * np.exp(
             dp * self.fluid.COMPRESSIBILITY - dT * self.fluid.thermal_expansion(dT)
         )
-
         return rho
 
-    def scalar_temperature_coupling_coefficient(self, g) -> float:
+    def _scalar_to_temperature_coupling_coefficient(self, g) -> float:
         """
         The temperature-pressure coupling coefficient is porosity times thermal
         expansion. The pressure and
         scalar scale must be accounted for wherever this coefficient is used.
         """
-        b_f = self.fluid.thermal_expansion(self.background_temp_C)
-        if g.dim < self.Nd:
+        c_f = self.fluid.specific_heat_capacity()
+        rho_f = self._fluid_density(g)
+        C_f = self.fluid.COMPRESSIBILITY
+        if g.dim < self._Nd:
+            coeff = c_f * rho_f * C_f
+        else:
+            c_s = self.rock.specific_heat_capacity()
+            rho_s = self.rock.DENSITY
+            K_s = self.rock.BULK_MODULUS
+            phi = self._porosity(g)
+            coeff = phi * c_f * rho_f * C_f + (1 - phi) * c_s * rho_s / K_s
+        return coeff / self.T_0_Kelvin
+
+    def _temperature_to_scalar_coupling_coefficient(self, g) -> float:
+        """
+        The temperature-pressure coupling coefficient is porosity times thermal
+        expansion. The pressure and
+        scalar scale must be accounted for wherever this coefficient is used.
+        """
+        b_f = self.fluid.thermal_expansion(0)
+        if g.dim < self._Nd:
             coeff = -b_f
         else:
-            b_s = self.rock.THERMAL_EXPANSION
-            phi = self.porosity(g)
+            b_s = 3 * self.rock.THERMAL_EXPANSION
+            phi = self._porosity(g)
             coeff = -b_f * phi - (1 - phi) * b_s
         return coeff
 
-    def aperture(self, g, from_iterate=True) -> np.ndarray:
+    def _aperture(self, g, from_iterate=True) -> np.ndarray:
         """
-        Obtain the aperture of a subdomain. See update_all_apertures.
+        Obtain the aperture of a subdomain. See _update_all_apertures.
         """
         if from_iterate:
             return self.gb.node_props(g)[pp.STATE][pp.ITERATE]["aperture"]
         else:
             return self.gb.node_props(g)[pp.STATE]["aperture"]
 
-    def specific_volumes(self, g, from_iterate=True) -> np.ndarray:
+    def _specific_volumes(self, g, from_iterate=True) -> np.ndarray:
         """
-        Obtain the specific volume of a subdomain. See update_all_apertures.
+        Obtain the specific volume of a subdomain. See _update_all_apertures.
         """
         if from_iterate:
             return self.gb.node_props(g)[pp.STATE][pp.ITERATE]["specific_volume"]
         else:
             return self.gb.node_props(g)[pp.STATE]["specific_volume"]
 
-    def update_all_apertures(self, to_iterate=True):
+    def _update_all_apertures(self, to_iterate=True):
         """
         To better control the aperture computation, it is done for the entire gb by a
         single function call. This also allows us to ensure the fracture apertures
         are updated before the intersection apertures are inherited.
-        The aperture of a fracture is 
+        The aperture of a fracture is
             initial aperture - || u_n || + tan(slip_angle) || jump(u_tau) ||
         """
         gb = self.gb
         for g, d in gb:
 
             apertures = np.ones(g.num_cells)
-            if g.dim == (self.Nd - 1):
+            if g.dim == (self._Nd - 1):
                 # Initial aperture
 
                 apertures *= self.initial_aperture
@@ -279,8 +307,9 @@ class Example1Model(THM):
                 g_h = gb.node_neighbors(g)[0]
                 data_edge = gb.edge_props((g, g_h))
                 if pp.STATE in data_edge:
+                    projection = d["tangential_normal_projection"]
                     u_mortar_local = self.reconstruct_local_displacement_jump(
-                        data_edge, from_iterate=to_iterate
+                        data_edge, projection, from_iterate=to_iterate
                     )
                     # Magnitudes of normal and tangential components
                     norm_u_n = np.absolute(u_mortar_local[-1])
@@ -304,7 +333,7 @@ class Example1Model(THM):
         for g, d in gb:
             parent_apertures = []
             num_parent = []
-            if g.dim < (self.Nd - 1):
+            if g.dim < (self._Nd - 1):
                 for edges in gb.edges_of_node(g):
                     e = edges[0]
                     g_h = e[0]
@@ -312,7 +341,7 @@ class Example1Model(THM):
                     if g_h == g:
                         g_h = e[1]
 
-                    if g_h.dim == (self.Nd - 1):
+                    if g_h.dim == (self._Nd - 1):
                         d_h = gb.node_props(g_h)
                         if to_iterate:
                             a_h = d_h[pp.STATE][pp.ITERATE]["aperture"]
@@ -320,14 +349,16 @@ class Example1Model(THM):
                             a_h = d_h[pp.STATE]["aperture"]
                         a_h_face = np.abs(g_h.cell_faces) * a_h
                         mg = gb.edge_props(e)["mortar_grid"]
-                        # Assumes g_h is master
+                        # Assumes g_h is primary
                         a_l = (
-                            mg.mortar_to_slave_avg()
-                            * mg.master_to_mortar_avg()
+                            mg.mortar_to_secondary_avg()
+                            * mg.primary_to_mortar_avg()
                             * a_h_face
                         )
                         parent_apertures.append(a_l)
-                        num_parent.append(np.sum(mg.mortar_to_slave_int().A, axis=1))
+                        num_parent.append(
+                            np.sum(mg.mortar_to_secondary_int().A, axis=1)
+                        )
                     else:
                         raise ValueError("Intersection points not implemented in 3d")
                 parent_apertures = np.array(parent_apertures)
@@ -336,7 +367,7 @@ class Example1Model(THM):
                 apertures = np.sum(parent_apertures, axis=0) / num_parents
 
                 specific_volumes = np.power(
-                    apertures, self.Nd - g.dim
+                    apertures, self._Nd - g.dim
                 )  # Could also be np.product(parent_apertures, axis=0)
                 if to_iterate:
                     pp.set_iterate(
@@ -355,7 +386,7 @@ class Example1Model(THM):
 
         return apertures
 
-    def set_permeability_from_aperture(self):
+    def _set_permeability_from_aperture(self):
         """
         Cubic law in fractures, rock permeability in the matrix.
         """
@@ -364,16 +395,16 @@ class Example1Model(THM):
         gb = self.gb
         key = self.scalar_parameter_key
         for g, d in gb:
-            if g.dim < self.Nd:
+            if g.dim < self._Nd:
                 # Use cubic law in fractures. First compute the unscaled
                 # permeability
-                apertures = self.aperture(g, from_iterate=True)
+                apertures = self._aperture(g, from_iterate=True)
                 apertures_unscaled = apertures * self.length_scale
                 k = np.power(apertures_unscaled, 2) / 12 / viscosity
                 d[pp.PARAMETERS][key]["perm_nu"] = k
                 # Multiply with the cross-sectional area, which equals the apertures
                 # for 2d fractures in 3d
-                specific_volumes = self.specific_volumes(g, True)
+                specific_volumes = self._specific_volumes(g, True)
 
                 k = k * specific_volumes
 
@@ -395,20 +426,20 @@ class Example1Model(THM):
             mg = d["mortar_grid"]
             g_l, g_h = gb.nodes_of_edge(e)
             data_l = gb.node_props(g_l)
-            a = self.aperture(g_l, True)
-            V = self.specific_volumes(g_l, True)
-            V_h = self.specific_volumes(g_h, True)
+            a = self._aperture(g_l, True)
+            V = self._specific_volumes(g_l, True)
+            V_h = self._specific_volumes(g_h, True)
             # We assume isotropic permeability in the fracture, i.e. the normal
             # permeability equals the tangential one
             k_s = data_l[pp.PARAMETERS][key]["second_order_tensor"].values[0, 0]
             # Division through half the aperture represents taking the (normal) gradient
-            kn = mg.slave_to_mortar_int() * np.divide(k_s, a * V / 2)
+            kn = mg.secondary_to_mortar_int() * np.divide(k_s, a * V / 2)
             tr = np.abs(g_h.cell_faces)
-            V_j = mg.master_to_mortar_int() * tr * V_h
+            V_j = mg.primary_to_mortar_int() * tr * V_h
             kn = kn * V_j
             pp.initialize_data(mg, d, key, {"normal_diffusivity": kn})
 
-    def set_rock_and_fluid(self):
+    def _set_rock_and_fluid(self):
         """
         Set rock and fluid properties to those of granite and water.
         We ignore all temperature dependencies of the parameters.
@@ -416,29 +447,29 @@ class Example1Model(THM):
         self.rock = Granite()
         self.fluid = Water()
 
-    def set_mechanics_parameters(self):
-        """ Mechanical parameters.
-        Note that we divide the momentum balance equation by self.scalar_scale. 
+    def _set_mechanics_parameters(self):
+        """Mechanical parameters.
+        Note that we divide the momentum balance equation by self.scalar_scale.
         A homogeneous initial temperature is assumed.
         """
         gb = self.gb
         for g, d in gb:
-            if g.dim == self.Nd:
+            if g.dim == self._Nd:
                 # Rock parameters
                 rock = self.rock
                 lam = rock.LAMBDA * np.ones(g.num_cells) / self.scalar_scale
                 mu = rock.MU * np.ones(g.num_cells) / self.scalar_scale
                 C = pp.FourthOrderTensor(mu, lam)
 
-                bc = self.bc_type_mechanics(g)
-                bc_values = self.bc_values_mechanics(g)
-                sources = self.source_mechanics(g)
+                bc = self._bc_type_mechanics(g)
+                bc_values = self._bc_values_mechanics(g)
+                sources = self._source_mechanics(g)
 
                 # In the momentum balance, the coefficient hits the scalar, and should
                 # not be scaled. Same goes for the energy balance, where we divide all
                 # terms by T_0, hence the term originally beta K T d(div u) / dt becomes
                 # beta K d(div u) / dt = coupling_coefficient d(div u) / dt.
-                coupling_coefficient = self.biot_alpha(g)
+                coupling_coefficient = self._biot_alpha(g)
 
                 pp.initialize_data(
                     g,
@@ -451,6 +482,7 @@ class Example1Model(THM):
                         "fourth_order_tensor": C,
                         "biot_alpha": coupling_coefficient,
                         "time_step": self.time_step,
+                        "p_reference": np.zeros(g.num_cells),
                     },
                 )
 
@@ -458,16 +490,20 @@ class Example1Model(THM):
                     g,
                     d,
                     self.mechanics_temperature_parameter_key,
-                    {"biot_alpha": self.biot_beta(g), "bc_values": bc_values},
+                    {
+                        "biot_alpha": self._biot_beta(g),
+                        "bc_values": bc_values,
+                        "p_reference": self.T_0_Kelvin * np.ones(g.num_cells),
+                    },
                 )
-            elif g.dim == self.Nd - 1:
+            elif g.dim == self._Nd - 1:
 
                 pp.initialize_data(
                     g,
                     d,
                     self.mechanics_parameter_key,
                     {
-                        "friction_coefficient": self._friction_coefficient(g),
+                        "friction_coefficient": self._set_friction_coefficient(g),
                         "contact_mechanics_numerical_parameter": 1e1,
                         "dilation_angle": self._dilation_angle,
                         "time": self.time,
@@ -484,25 +520,25 @@ class Example1Model(THM):
                 {"mu": self.rock.MU, "lambda": self.rock.LAMBDA},
             )
 
-    def set_scalar_parameters(self):
+    def _set_scalar_parameters(self):
 
         for g, d in self.gb:
 
-            a = self.aperture(g)
-            specific_volumes = self.specific_volumes(g)
+            a = self._aperture(g)
+            specific_volumes = self._specific_volumes(g)
 
             # Define boundary conditions for flow
-            bc = self.bc_type_scalar(g)
+            bc = self._bc_type_scalar(g)
             # Set boundary condition values
-            bc_values = self.bc_values_scalar(g)
+            bc_values = self._bc_values_scalar(g)
 
-            biot_coefficient = self.biot_alpha(g)
+            biot_coefficient = self._biot_alpha(g)
             compressibility = self.fluid.COMPRESSIBILITY
 
-            mass_weight = compressibility * self.porosity(g)
-            if g.dim == self.Nd:
+            mass_weight = compressibility * self._porosity(g)
+            if g.dim == self._Nd:
                 mass_weight += (
-                    biot_coefficient - self.porosity(g)
+                    biot_coefficient - self._porosity(g)
                 ) / self.rock.BULK_MODULUS
             elif g.dim == 1 and (self._dilation_angle_constant_g > 1e-5):
                 biot_coefficient *= 0
@@ -519,14 +555,14 @@ class Example1Model(THM):
                     "mass_weight": mass_weight,
                     "biot_alpha": biot_coefficient,
                     "time_step": self.time_step,
-                    "ambient_dimension": self.Nd,
-                    "source": self.source_scalar(g)
-                    + self.dVdt_source(g, d, self.scalar_parameter_key),
+                    "ambient_dimension": self._Nd,
+                    "source": self._source_scalar(g)
+                    + self._dVdt_source(g, d, self.scalar_parameter_key),
                 },
             )
 
             t2s_coupling = (
-                self.scalar_temperature_coupling_coefficient(g)
+                self._temperature_to_scalar_coupling_coefficient(g)
                 * specific_volumes
                 * self.temperature_scale
             )
@@ -536,34 +572,34 @@ class Example1Model(THM):
                 self.t2s_parameter_key,
                 {"mass_weight": t2s_coupling, "time_step": self.time_step},
             )
-        self.set_vector_source()
+        self._set_vector_source()
 
-        self.set_permeability_from_aperture()
+        self._set_permeability_from_aperture()
 
-    def set_vector_source(self):
+    def _set_vector_source(self):
         if not getattr(self, "gravity_on", False):
             return
         for g, d in self.gb:
             grho = (
                 pp.GRAVITY_ACCELERATION
-                * self.density(g)  
+                * self._fluid_density(g)
                 / self.scalar_scale
                 * self.length_scale
             )
-            gr = np.zeros((self.Nd, g.num_cells))
-            gr[self.Nd - 1, :] = -grho
+            gr = np.zeros((self._Nd, g.num_cells))
+            gr[self._Nd - 1, :] = -grho
             d[pp.PARAMETERS][self.scalar_parameter_key]["vector_source"] = gr.ravel("F")
         for e, data_edge in self.gb.edges():
             g1, g2 = self.gb.nodes_of_edge(e)
             params_l = self.gb.node_props(g1)[pp.PARAMETERS][self.scalar_parameter_key]
             mg = data_edge["mortar_grid"]
             grho = (
-                mg.slave_to_mortar_avg()
-                * params_l["vector_source"][self.Nd - 1 :: self.Nd]
+                mg.secondary_to_mortar_avg()
+                * params_l["vector_source"][self._Nd - 1 :: self._Nd]
             )
-            a = mg.slave_to_mortar_avg() * self.aperture(g1)
-            gravity = np.zeros((self.Nd, mg.num_cells))
-            gravity[self.Nd - 1, :] = grho * a / 2
+            a = mg.secondary_to_mortar_avg() * self._aperture(g1)
+            gravity = np.zeros((self._Nd, mg.num_cells))
+            gravity[self._Nd - 1, :] = grho * a / 2
 
             data_edge = pp.initialize_data(
                 e,
@@ -572,36 +608,36 @@ class Example1Model(THM):
                 {"vector_source": gravity.ravel("F")},
             )
 
-    def set_temperature_parameters(self):
-        """ temperature parameters.
+    def _set_temperature_parameters(self):
+        """temperature parameters.
         The entire equation is divided by the initial temperature in Kelvin.
         """
         div_T_scale = self.temperature_scale / self.length_scale ** 2 / self.T_0_Kelvin
         kappa_f = self.fluid.thermal_conductivity() * div_T_scale
         kappa_s = self.rock.thermal_conductivity() * div_T_scale
 
-        heat_capacity_s = (
-            self.rock.specific_heat_capacity(self.background_temp_C) * self.rock.DENSITY
-        )
+        heat_capacity_s = self.rock.specific_heat_capacity() * self.rock.DENSITY
         for g, d in self.gb:
-            heat_capacity_f = self.density(g) * self.fluid.specific_heat_capacity(
-                self.background_temp_C
+            heat_capacity_f = (
+                self._fluid_density(g) * self.fluid.specific_heat_capacity()
             )
-            # ()
-            # Aperture and cross sectional area
-            specific_volumes = self.specific_volumes(g)
-            porosity = self.porosity(g)
+            # Aperture and cross-sectional area
+            specific_volumes = self._specific_volumes(g)
+            porosity = self._porosity(g)
             # Define boundary conditions for flow
-            bc = self.bc_type_temperature(g)
+            bc = self._bc_type_temperature(g)
             # Set boundary condition values
-            bc_values = self.bc_values_temperature(g)
+            bc_values = self._bc_values_temperature(g)
             # and source values
-            biot_coefficient = self.biot_beta(g)
-            if g.dim == self.Nd - 1 and (self._dilation_angle_constant_g > 1e-5):
+            biot_coefficient = self._biot_beta(g)
+            if g.dim == self._Nd - 1 and (self._dilation_angle_constant_g > 1e-5):
                 biot_coefficient = 0
+            T_k = d[pp.STATE][pp.ITERATE][self.temperature_variable]
 
-            effective_heat_capacity = (
-                porosity * heat_capacity_f + (1 - porosity) * heat_capacity_s
+            effective_heat_capacity = porosity * heat_capacity_f * (
+                1 - T_k * self.fluid.thermal_expansion(0)
+            ) + (1 - porosity) * heat_capacity_s * (
+                1 - T_k * 3 * self.rock.THERMAL_EXPANSION
             )
             mass_weight = (
                 effective_heat_capacity
@@ -617,7 +653,7 @@ class Example1Model(THM):
 
             advection_weight = (
                 heat_capacity_f * self.temperature_scale / self.T_0_Kelvin
-            )  # "should" have a length scale, but darcy_fluxes are scaled
+            )
             pp.initialize_data(
                 g,
                 d,
@@ -630,17 +666,19 @@ class Example1Model(THM):
                     "advection_weight": advection_weight,
                     "biot_alpha": biot_coefficient,
                     "time_step": self.time_step,
-                    "source": self.source_temperature(g)
-                    + self.dVdt_source(g, d, self.temperature_parameter_key),
-                    "ambient_dimension": self.Nd,
+                    "source": self._source_temperature(g)
+                    + self._dVdt_source(g, d, self.temperature_parameter_key),
+                    "ambient_dimension": self._Nd,
                 },
             )
 
             s2t_coupling = (
-                self.scalar_temperature_coupling_coefficient(g)
+                self._scalar_to_temperature_coupling_coefficient(g)
                 * specific_volumes
                 * self.scalar_scale
+                * T_k
             )
+
             pp.initialize_data(
                 g,
                 d,
@@ -651,12 +689,12 @@ class Example1Model(THM):
         for e, data_edge in self.gb.edges():
             g_l, g_h = self.gb.nodes_of_edge(e)
             mg = data_edge["mortar_grid"]
-            a_l = self.aperture(g_l)
-            V_h = self.specific_volumes(g_h)
-            a_mortar = mg.slave_to_mortar_avg() * a_l
+            a_l = self._aperture(g_l)
+            V_h = self._specific_volumes(g_h)
+            a_mortar = mg.secondary_to_mortar_avg() * a_l
             kappa_n = 2 / a_mortar * kappa_f
             tr = np.abs(g_h.cell_faces)
-            V_j = mg.master_to_mortar_int() * tr * V_h
+            V_j = mg.primary_to_mortar_int() * tr * V_h
             kappa_n = kappa_n * V_j
             data_edge = pp.initialize_data(
                 e,
@@ -665,28 +703,29 @@ class Example1Model(THM):
                 {"normal_diffusivity": kappa_n},
             )
 
-    def dVdt_source(self, g, d, key) -> np.ndarray:
-        """ Compute the dV/dt term for intersections
+    def _dVdt_source(self, g, d, key) -> np.ndarray:
+        """Compute the dV/dt term for intersections
         from the previous iteration and time step.
         """
         val = np.zeros(g.num_cells)
 
-        if g.dim == self.Nd:
+        if g.dim == self._Nd:
             return val
-        if g.dim < self.Nd - 1 or not np.isclose(self._dilation_angle_constant_g, 0):
+        if g.dim < self._Nd - 1 or not np.isclose(self._dilation_angle_constant_g, 0):
             dV, *_ = self._variable_increment(g, "specific_volume")
-            val = dV * g.cell_volumes
+            # Sign accounts for moving to rhs
+            val = -dV * g.cell_volumes
             if key == self.temperature_parameter_key:
-                val *= -self.biot_beta(g)
+                val *= self._biot_beta(g)
         return val
 
-    def assign_discretizations(self) -> None:
+    def _assign_discretizations(self) -> None:
         """
         For long time steps, scaling the diffusive interface fluxes in the non-default
         way turns out to actually be beneficial for the condition number.
         """
         # Call parent class for disrcetizations.
-        super().assign_discretizations()
+        super()._assign_discretizations()
 
         for e, d in self.gb.edges():
             d[pp.COUPLING_DISCRETIZATION][self.temperature_coupling_term][e][
@@ -699,41 +738,47 @@ class Example1Model(THM):
     def prepare_simulation(self):
         self.create_grid()
         self._set_time_parameters()
-        self.set_rock_and_fluid()
+        self._set_rock_and_fluid()
         # self._iteration = 0
-        self.initial_condition()
-        self.set_parameters()
-        self.assign_variables()
-        self.assign_discretizations()
+        self._initial_condition()
+        self._set_parameters()
+        self._assign_variables()
+        self._assign_discretizations()
 
-        self.discretize()
-        self.initialize_linear_solver()
+        self._discretize()
+        self._initialize_linear_solver()
 
-        self.export_step()
+        self._export_step()
 
     def before_newton_loop(self):
         super().before_newton_loop()
         self._iteration = 0
 
     def before_newton_iteration(self):
-        """ Rediscretize. Should the parent be updated?
-        """
+        """Rediscretize. Should the parent be updated?"""
 
         self._iteration += 1
         self.compute_fluxes()
-        self.update_all_apertures(to_iterate=True)
+        self._update_all_apertures(to_iterate=True)
 
-        self.set_parameters()
+        self._set_parameters()
         #
         t_0 = time.time()
-        self.assembler.discretize(
-            term_filter=["!mpsa", "!stabilization", "!div_u", "!grad_p", "!diffusion"]
-        )
-        for dim in range(self.Nd - 1):
+        term_list = [
+            "!mpsa",
+            "!stabilization",
+            "!div_u",
+            "!grad_p",
+            "!diffusion",
+        ]
+        filt = pp.assembler_filters.ListFilter(term_list=term_list)
+        self.assembler.discretize(filt=filt)
+        for dim in range(self._Nd - 1):
             for g in self.gb.grids_of_dimension(dim):
-                self.assembler.discretize(
-                    term_filter=["diffusion"], grid=g, edges=False
+                filt = pp.assembler_filters.ListFilter(
+                    term_list=["diffusion"], grid_list=[g]
                 )
+                self.assembler.discretize(filt=filt)
         logger.info("Rediscretized in {} s.".format(time.time() - t_0))
 
     #
@@ -742,17 +787,17 @@ class Example1Model(THM):
         for g, d in self.gb:
             d[pp.STATE]["previous_u_exp"] = d[pp.STATE]["u_exp"].copy()
         super().after_newton_convergence(solution, errors, iteration_counter)
-        self.update_all_apertures(to_iterate=False)
-        self.update_all_apertures(to_iterate=True)
-        self.export_step()
-        self.adjust_time_step()
-        self.save_data(errors, iteration_counter)
+        self._update_all_apertures(to_iterate=False)
+        self._update_all_apertures(to_iterate=True)
+        self._export_step()
+        self._adjust_time_step()
+        self._save_data(errors, iteration_counter)
 
     def assemble_and_solve_linear_system(self, tol):
         if getattr(self, "report_A", False):
             A, b = self.assembler.assemble_matrix_rhs(add_matrices=False)
             for key in A.keys():
-                print("{:.2e} {}".format(np.max(np.abs(A[key])), key))
+                logger.info("{:.2e} {}".format(np.max(np.abs(A[key])), key))
 
         A, b = self.assembler.assemble_matrix_rhs()
         use_umfpack = self.params.get("use_umfpack", True)
@@ -783,23 +828,25 @@ class Example1Model(THM):
             error = np.nan if diverged else 0
             return error, converged, diverged
 
-        mech_dof = self.assembler.dof_ind(g_max, self.displacement_variable)
-        p_dof = self.assembler.dof_ind(g_max, self.scalar_variable)
+        mech_dof = self.dof_manager.dof_ind(g_max, self.displacement_variable)
+        p_dof = self.dof_manager.dof_ind(g_max, self.scalar_variable)
         for g, _ in self.gb:
-            p_dof = np.hstack((p_dof, self.assembler.dof_ind(g, self.scalar_variable)))
-        T_dof = self.assembler.dof_ind(g_max, self.temperature_variable)
+            p_dof = np.hstack(
+                (p_dof, self.dof_manager.dof_ind(g, self.scalar_variable))
+            )
+        T_dof = self.dof_manager.dof_ind(g_max, self.temperature_variable)
         for g, _ in self.gb:
             T_dof = np.hstack(
-                (T_dof, self.assembler.dof_ind(g, self.temperature_variable))
+                (T_dof, self.dof_manager.dof_ind(g, self.temperature_variable))
             )
         # Also find indices for the contact variables
         contact_dof = np.array([], dtype=np.int)
         for e, _ in self.gb.edges():
-            if e[0].dim == self.Nd:
+            if e[0].dim == self._Nd:
                 contact_dof = np.hstack(
                     (
                         contact_dof,
-                        self.assembler.dof_ind(e[1], self.contact_traction_variable),
+                        self.dof_manager.dof_ind(e[1], self.contact_traction_variable),
                     )
                 )
 
@@ -832,7 +879,12 @@ class Example1Model(THM):
         # Not sure how to use the divergence criterion
         # tol_divergence = nl_params["nl_divergence_tol"]
 
-        converged_mech, converged_p, converged_T = False, False, False
+        converged_mech, converged_p, converged_T, converged_contact = (
+            False,
+            False,
+            False,
+            False,
+        )
         diverged = False
 
         # Check absolute convergence criterion
@@ -842,74 +894,66 @@ class Example1Model(THM):
 
         else:
             # Check relative convergence criterion
-            if (
-                difference_in_iterates_mech
-                < tol_convergence * difference_from_init_mech
-            ):
+            u_norm = np.sum(u_mech_now ** 2)
+            if difference_in_iterates_mech < tol_convergence * u_norm:
                 converged_mech = True
-            error_mech = difference_in_iterates_mech / difference_from_init_mech
+            error_mech = difference_in_iterates_mech / u_norm
         # 1e3 for scale difference between T and u
-        scaled_tol = 1e2 * tol_convergence
+        scaled_tol = tol_convergence
         if difference_in_iterates_T < scaled_tol:
-            # It is assumed that we operate on T-T_0, i.e. difference from init
-            # equals current solution
             error_T = difference_in_iterates_T
             converged_T = True
         else:
             T_norm = np.sum(T_now ** 2)
             if difference_in_iterates_T < scaled_tol * T_norm:
                 converged_T = True
-            #                if converged:
-            #                    logger.info("Not converged due to temperature error")
             error_T = difference_in_iterates_T / T_norm
 
-        scaled_tol = tol_convergence
         if difference_in_iterates_p < scaled_tol:
-            # It is assumed that we operate on T-T_0, i.e. difference from init
-            # equals current solution
             error_p = difference_in_iterates_p
             converged_p = True
         else:
             p_norm = np.sum(p_now ** 2)
             if difference_in_iterates_p < scaled_tol * p_norm:
                 converged_p = True
-            #                if converged:
-            #                    logger.info("Not converged due to pressure error")
             error_p = difference_in_iterates_p / p_norm
+
+        scaled_tol = tol_convergence * 10
         # The if is intended to avoid division through zero
-        if contact_norm < 1e-10 and difference_in_iterates_contact < 1e-10:
-            # converged = True
+        if difference_in_iterates_contact < tol_convergence:
             error_contact = difference_in_iterates_contact
+            converged_contact = True
         else:
-            error_contact = (
-                difference_in_iterates_contact / difference_from_init_contact
-            )
-        converged = converged_mech and converged_T and converged_p
-        #        if not converged:
-        #            logger.info(
-        #                "Convergence for u, T and p is {}, {}, {}".format(
-        #                    converged_mech, converged_T, converged_p
-        #                )
-        #            )
+            contact_norm = np.sum(contact_now ** 2)
+            if difference_in_iterates_contact < scaled_tol * contact_norm:
+                converged_contact = True
+            error_contact = difference_in_iterates_contact / contact_norm
+
+        converged = converged_mech and converged_T and converged_p and converged_contact
 
         logger.info(
             "Errors: contact force {:.2e}, matrix displacement {:.2e}, temperature {:.2e} and pressure {:.2e}".format(
                 error_contact, error_mech, error_T, error_p
             )
         )
-        # \        logger.info("Error in matrix displacement is {:.2e}".format(error_mech))
-        #      logger.info("Error in matrix temperature is {:.2e}".format(error_T))
-        #      logger.info("Error in matrix pressure is {:.2e}".format(error_p))
+        logger.info(
+            "Differences: contact force {:.2e}, matrix displacement {:.2e}, temperature {:.2e} and pressure {:.2e}".format(
+                difference_in_iterates_contact,
+                difference_in_iterates_mech,
+                difference_in_iterates_T,
+                difference_in_iterates_contact,
+            )
+        )
 
         return error_mech, converged, diverged
 
-    def set_exporter(self):
+    def _set_exporter(self):
         self.exporter = pp.Exporter(
             self.gb, self.file_name, folder_name=self.viz_folder_name + "_vtu"
         )
         self.export_times = []
 
-    def export_step(self):
+    def _export_step(self):
         """
         Export the current solution to vtu. The method sets the desired values in d[pp.STATE].
         For some fields, it provides zeros in the dimensions where the variable is not defined,
@@ -919,34 +963,34 @@ class Example1Model(THM):
         stored in d.
         """
         if "exporter" not in self.__dict__:
-            self.set_exporter()
+            self._set_exporter()
         for g, d in self.gb:
-            if g.dim == self.Nd:
+            if g.dim == self._Nd:
                 pad_zeros = np.zeros((3 - g.dim, g.num_cells))
                 u = d[pp.STATE][self.displacement_variable].reshape(
-                    (self.Nd, -1), order="F"
+                    (self._Nd, -1), order="F"
                 )
                 u_exp = np.vstack((u * self.length_scale, pad_zeros))
                 d[pp.STATE]["u_exp"] = u_exp
                 d[pp.STATE]["u_global"] = u_exp
                 d[pp.STATE]["traction_exp"] = np.zeros(d[pp.STATE]["u_exp"].shape)
-            elif g.dim == (self.Nd - 1):
+            elif g.dim == (self._Nd - 1):
                 pad_zeros = np.zeros((2 - g.dim, g.num_cells))
                 g_h = self.gb.node_neighbors(g)[0]
                 data_edge = self.gb.edge_props((g, g_h))
-
+                projection = d["tangential_normal_projection"]
                 u_mortar_local = self.reconstruct_local_displacement_jump(
-                    data_edge, from_iterate=False
+                    data_edge, projection, from_iterate=False
                 )
                 mortar_u = data_edge[pp.STATE][self.mortar_displacement_variable]
                 mg = data_edge["mortar_grid"]
                 displacement_jump_global_coord = (
-                    mg.mortar_to_slave_avg(nd=self.Nd)
-                    * mg.sign_of_mortar_sides(nd=self.Nd)
+                    mg.mortar_to_secondary_avg(nd=self._Nd)
+                    * mg.sign_of_mortar_sides(nd=self._Nd)
                     * mortar_u
                 )
                 u_mortar_global = displacement_jump_global_coord.reshape(
-                    (self.Nd, -1), order="F"
+                    (self._Nd, -1), order="F"
                 )
                 u_exp = np.vstack((u_mortar_local * self.length_scale, pad_zeros))
                 d[pp.STATE]["u_exp"] = u_exp
@@ -954,7 +998,7 @@ class Example1Model(THM):
                     (u_mortar_global * self.length_scale, pad_zeros)
                 )
                 traction = d[pp.STATE][self.contact_traction_variable].reshape(
-                    (self.Nd, -1), order="F"
+                    (self._Nd, -1), order="F"
                 )
 
                 d[pp.STATE]["traction_exp"] = (
@@ -966,29 +1010,26 @@ class Example1Model(THM):
                 d[pp.STATE]["u_exp"] = u_exp
                 d[pp.STATE]["u_global"] = np.zeros((3, g.num_cells))
 
-            d[pp.STATE]["aperture_exp"] = self.aperture(g) * self.length_scale
-            if np.isclose(self.time, 0):
-                d[pp.STATE]["aperture_0"] = self.aperture(g) * self.length_scale
-                d[pp.STATE]["u_exp_0"] = u_exp
+            d[pp.STATE]["aperture_exp"] = self._aperture(g) * self.length_scale
 
             d[pp.STATE]["p_exp"] = d[pp.STATE][self.scalar_variable] * self.scalar_scale
             d[pp.STATE]["T_exp"] = (
                 d[pp.STATE][self.temperature_variable] * self.temperature_scale
             )
             d[pp.STATE]["du"] = d[pp.STATE]["u_exp"] - d[pp.STATE]["previous_u_exp"]
-        self.exporter.write_vtk(self.export_fields, time_step=self.time)
+        self.exporter.write_vtu(self.export_fields, time_step=self.time)
         self.export_times.append(self.time)
 
-    def export_pvd(self):
+    def _export_pvd(self):
         """
         At the end of the simulation, after the final vtu file has been exported, the
         pvd file for the whole simulation is written by calling this method.
         """
         self.exporter.write_pvd(np.array(self.export_times))
 
-    def save_data(self, errors, iteration_counter):
+    def _save_data(self, errors, iteration_counter):
         """
-        Save displacement jumps and number of iterations for visualisation purposes. 
+        Save displacement jumps and number of iterations for visualisation purposes.
         These are written to file and plotted against time in Figure 4.
         """
         n = self.n_frac
@@ -1011,11 +1052,12 @@ class Example1Model(THM):
                     for var in ["p", "T", "u_exp", "contact_traction"]:
                         val = d[pp.STATE].get("{}".format(var, i), np.empty(0))
                         d[pp.STATE]["{}_phase_{}".format(var, i)] = val
-            if g.dim == self.Nd - 1:
+            if g.dim == self._Nd - 1:
                 g_h = self.gb.node_neighbors(g)[0]
                 data_edge = self.gb.edge_props((g, g_h))
+                projection = d["tangential_normal_projection"]
                 u_mortar_local = self.reconstruct_local_displacement_jump(
-                    data_edge, from_iterate=False
+                    data_edge, projection, from_iterate=False
                 )
                 tangential_jump = np.linalg.norm(
                     u_mortar_local[:-1] * self.length_scale, axis=0
@@ -1039,13 +1081,13 @@ class Example1Model(THM):
                 # of the vector, second cell has the next self.dim etc.
                 # By design the tangential force is the first self.dim-1 components of
                 # each cell, while the normal force is the last component.
-                normal_indices = np.arange(self.Nd - 1, contact_force.size, self.Nd)
+                normal_indices = np.arange(self._Nd - 1, contact_force.size, self._Nd)
                 tangential_indices = np.setdiff1d(
                     np.arange(contact_force.size), normal_indices
                 )
                 contact_force_normal = contact_force[normal_indices]
                 contact_force_tangential = contact_force[tangential_indices].reshape(
-                    (self.Nd - 1, g.num_cells), order="F"
+                    (self._Nd - 1, g.num_cells), order="F"
                 )
 
                 tangential_force_norm = (
@@ -1067,10 +1109,7 @@ class Example1Model(THM):
             (self.force_tangential, tangential_force)
         )
 
-    def initial_condition(self) -> None:
-        """
-        Initial value for the Darcy fluxes. TODO: Add to THM.
-        """
+    def _initial_condition(self) -> None:
         for g, d in self.gb:
             d[pp.PARAMETERS] = pp.Parameters()
             d[pp.PARAMETERS].update_dictionaries(
@@ -1081,31 +1120,27 @@ class Example1Model(THM):
                     self.temperature_parameter_key,
                 ]
             )
-        self.update_all_apertures(to_iterate=False)
-        self.update_all_apertures()
-        super().initial_condition()
+        self._update_all_apertures(to_iterate=False)
+        self._update_all_apertures()
+        super()._initial_condition()
 
         for g, d in self.gb:
-            d[pp.PARAMETERS][self.temperature_parameter_key].update(
-                {"darcy_flux": np.zeros(g.num_faces)}
-            )
             d[pp.STATE]["cell_centers"] = g.cell_centers.copy()
-            p0 = self.initial_scalar(g)
+            p0 = self._initial_scalar(g)
+            T0 = self._initial_temperature(g)
             state = {
                 self.scalar_variable: p0,
-                "u_exp_0": np.zeros((3, g.num_cells)),
-                "aperture_0": self.aperture(g) * self.length_scale,
+                self.temperature_variable: T0,
                 "previous_u_exp": np.zeros((3, g.num_cells)),
             }
             iterate = {
                 self.scalar_variable: p0,
-                self.temperature_variable: np.zeros(g.num_cells),
-            }  # For initial flux
-
+                self.temperature_variable: T0,
+            }
             pp.set_state(d, state)
             pp.set_iterate(d, iterate)
 
-    def initial_scalar(self, g) -> np.ndarray:
+    def _initial_scalar(self, g) -> np.ndarray:
         if getattr(self, "gravity_on", False):
             depth = self._depth(g.cell_centers)
         else:
@@ -1113,15 +1148,18 @@ class Example1Model(THM):
 
         return self.fluid.hydrostatic_pressure(depth) / self.scalar_scale
 
+    def _initial_temperature(self, g) -> np.ndarray:
+        return self.T_0_Kelvin * np.ones(g.num_cells)
+
     def _set_time_parameters(self):
         """
         Specify time parameters.
         """
         # For the initialization run, we use the following
         # start time
-        self.time = self.params.get("time", -1e5)
+        self.time = self.params.get("time", -1e6)
         # and time step
-        self.time_step = self.params.get("time_step", -self.time)
+        self.time_step = -self.time
 
         # We use
         self.end_time = 10 * pp.HOUR
@@ -1129,18 +1167,19 @@ class Example1Model(THM):
         self.phase_limits = np.array([self.time, 0, 3e1, self.end_time])
         self.phase_time_steps = np.array([self.time_step, 2e0, 2 / 3 * pp.HOUR, 1.0])
 
-    def _friction_coefficient(self, g) -> float:
+    def _set_friction_coefficient(self, g) -> float:
         """
         Friction coefficient for the fractures.
-        Used for comparison with traction ratio, which always is dimensionless, i.e. no scaling.
+        Used for comparison with traction ratio, which always is dimensionless,
+        i.e. no scaling.
         """
         return 0.5
 
-    def adjust_time_step(self):
+    def _adjust_time_step(self):
         """
         Adjust the time step so that smaller time steps are used when the driving forces
         are changed. Also make sure to exactly reach the start and end time for
-        each phase. 
+        each phase.
         """
         # Default is to just increase the time step somewhat
         self.time_step = getattr(self, "time_step_factor", 1.0) * self.time_step
@@ -1157,11 +1196,10 @@ class Example1Model(THM):
         if self.time > 0:
             self.time_step = min(self.time_step, self.max_time_step)
 
-    def set_fields(self, params, gb=None):
+    def _set_fields(self, params, gb=None):
         """
         Set various fields to be used in the model.
         """
-        # We operate on the temperature difference T-T_0
         self.T_0_Kelvin = 300
         self.background_temp_C = self.T_0_Kelvin - 273
         if gb is not None:
@@ -1183,6 +1221,7 @@ class Example1Model(THM):
             "aperture_exp",
             "u_global",
             "cell_centers",
+            "du",
         ]
         # Initial aperture, a_0
         self.initial_aperture = 5e-4 / self.length_scale
@@ -1195,7 +1234,7 @@ class Example1Model(THM):
         self.mesh_args = params.get("mesh_args", None)
 
     def _variable_increment(self, g, variable, scale=1, x0=None):
-        """ Extracts the variable solution of the current and previous time step and
+        """Extracts the variable solution of the current and previous time step and
         computes the increment.
         """
         d = self.gb.node_props(g)
@@ -1264,12 +1303,20 @@ class Granite(pp.Granite):
 
 
 if __name__ == "__main__":
+    mesh_size = 0.8
+    mesh_args = {
+        "mesh_size_frac": mesh_size,
+        "mesh_size_min": 0.5 * mesh_size,
+        "mesh_size_bound": 3.6 * mesh_size,
+    }
     params = {
         "nl_convergence_tol": 1e-8,
-        "max_iterations": 20,
+        "max_iterations": 50,
         "file_name": "thm",
         "dilation_angle": np.radians(5),
         "dilation_angle_constant_g": 0,
+        "use_umfpack": True,
+        "mesh_args": mesh_args,
     }
 
     root_folder = "ex1/"
@@ -1280,8 +1327,8 @@ if __name__ == "__main__":
     gb_list, models = [], []
     refinement_levels = np.arange(0, 6)
 
-    if refinement_levels[0] > 3:
-        gb_list = utils.read_pickle(pickle_file_name)
+    if refinement_levels[0] > 1:
+        gb_list = thm_utils.read_pickle(pickle_file_name)
         if gb_list is None:
             gb_list = []
 
@@ -1292,22 +1339,22 @@ if __name__ == "__main__":
         if not os.path.exists(folder_name):
             os.makedirs(folder_name)
 
-        # Create grid bucket from existing mesh files for reproducability
+        # Create grid bucket from existing mesh files for reproducibility
         msh_file = gmsh_file_base + str(i) + ".msh"
         grid_list = pp.fracs.simplex.triangle_grid_from_gmsh(file_name=msh_file)
         gb = pp.fracs.meshing.grid_list_to_grid_bucket(grid_list)
 
         m = Example1Model(params, gb)
-        gb_list.append(gb)
+        gb_list.append(m.gb)
 
         pp.run_time_dependent_model(m, params)
 
         # Export and save data
-        m.export_pvd()
-        utils.write_fracture_data_txt(m)
-        utils.write_pickle(gb_list, pickle_file_name)
+        m._export_pvd()
+        thm_utils.write_fracture_data_txt(m)
+        thm_utils.write_pickle(gb_list, pickle_file_name)
     # Compute grid mappings for error computation
     if len(gb_list) > 1:
         for gb in gb_list[:-1]:
             pp.grids.match_grids.gb_refinement(gb, gb_list[-1])
-    utils.write_pickle(gb_list, pickle_file_name)
+    thm_utils.write_pickle(gb_list, pickle_file_name)
